@@ -6,3 +6,5 @@ More to add:
 Support for continuous action spaces
 
 Adding a CNNPolicy
+
+Trying to add a RNNLayer
