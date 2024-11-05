@@ -10,3 +10,5 @@ Support for continuous action spaces
 Adding a CNNPolicy
 
 Trying to add a RNNLayer
+
+Adding Benchmarks
