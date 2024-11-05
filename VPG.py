@@ -1,107 +1,97 @@
-from gymnasium import Env
-from main import Base, printb
-from tqdm import tqdm
-from torch.utils.tensorboard.writer import SummaryWriter
 import torch
 import numpy as np
-import torch.nn as nn
+from torch.utils.tensorboard.writer import SummaryWriter
+from gymnasium import Env
+from tqdm import tqdm
+from main import Base, printb
 
 torch.set_default_device('cuda')
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
 
 class VPG(Base):
-    def __init__(self, env: Env, logdir: str, gamma=1) -> None:
+    def __init__(self, env: Env, logdir: str, gamma=1, batch_size=32, accumulation_steps=8) -> None:
+        super().__init__(input_size=env.observation_space.shape[0], output_size=env.action_space.n, probs=True)
         self.env = env
         self.logdir = logdir
-        self.actionlen = self.env.action_space.n
-        self.writer = SummaryWriter(self.logdir)
+        self.batch_size = batch_size
         self.gamma = gamma
+        self.writer = SummaryWriter(logdir)
+        self.accumulation_steps = accumulation_steps
+        self.accumulation_counter = 0
         self.buffer = []
-        super().__init__(input_size=self.env.observation_space.shape[0], output_size=self.actionlen, probs=True)
 
     def compute_returns(self, rewards):
-        returns = []
+        returns = torch.zeros(len(rewards), dtype=torch.float32, device='cuda')
         G = 0
-        for r in reversed(rewards):
-            G = r + self.gamma * G
-            returns.insert(0, G)
-        return torch.tensor(returns, dtype=torch.float64)
+        for i in reversed(range(len(rewards))):
+            G = rewards[i] + self.gamma * G
+            returns[i] = G
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        return returns
 
-    def act(self, obs : torch.Tensor):
-        obs = obs.to(torch.float64)
-        dist = self(obs)
+    def step_optimizer(self, loss, accumulate=False):
+        loss.backward()
+        if accumulate:
+            self.accumulation_counter += 1
+            if self.accumulation_counter % self.accumulation_steps == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.accumulation_counter = 0
+        else:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+    def act(self, obs: torch.Tensor):
+        dist = self(obs.to(torch.float32))
         select = torch.distributions.Categorical(dist)
         action = select.sample()
         logit = select.log_prob(action)
         return action, logit
-    
+
     def infer(self):
         obs, logit, reward = zip(*self.buffer)
         reward = self.compute_returns(reward)
-        obs = torch.stack(obs)
+        obs = torch.stack(obs).to('cuda')
+        logit = torch.stack(logit).to('cuda')
 
-        reward = (reward - reward.mean()) / (reward.std() + 1e-8)
-
-        logit = torch.stack(logit)
         loss = -(logit.view(-1) * reward).sum()
-        self.step_optimizer(loss)
-
+        self.step_optimizer(loss, accumulate=True)
         self.buffer.clear()
-        return loss.item()
-    
+
     def learn(self, timesteps: int):
         self.epsilon = 1
-        rew_list = []
-        loss_list = []
-        steps_list = []
+        rew_list, steps_list = [], []
 
-        for i in tqdm(range(timesteps)):
+        for i in tqdm(range(1, timesteps + 1)):
             obs, _ = self.env.reset()
-            obs = torch.tensor(obs, dtype=torch.float64)
+            obs = torch.tensor(obs, dtype=torch.float32, device='cuda')
             terminated = False
-            total_reward = 0
-            steps = 0
+            total_reward, steps = 0, 0
 
             while not terminated:
-                prev_obs = obs.clone()
                 action, logit = self.act(obs)
                 obs, rew, terminated, truncated, _ = self.env.step(action.item())
-                obs=torch.tensor(obs, dtype=torch.float64)
+                obs = torch.tensor(obs, dtype=torch.float32, device='cuda')
                 total_reward += rew
-                self.buffer.append([prev_obs, logit, rew])                
+                self.buffer.append((obs, logit, rew))
                 steps += 1
                 if truncated:
                     break
-            
-            loss = self.infer()
-            loss_list.append(loss)
 
             rew_list.append(total_reward)
             steps_list.append(steps)
 
-            self.writer.add_scalar("Reward/avg", np.mean(rew_list), i)
-            self.writer.add_scalar("Reward/max", np.max(rew_list), i)
-            self.writer.add_scalar("Reward/min", np.min(rew_list), i)
-            self.writer.add_scalar("Loss/avg", np.mean(loss_list), i)
-            self.writer.add_scalar("Loss/max", np.max(loss_list), i)
-            self.writer.add_scalar("Loss/min", np.min(loss_list), i)
-            self.writer.add_scalar("Steps/avg", np.mean(steps_list), i)
-            self.writer.add_scalar("Steps/max", np.max(steps_list), i)
-            self.writer.add_scalar("Steps/min", np.min(steps_list), i)
-            self.writer.add_scalar("Epsilon", self.epsilon, i)
+            if i % 32 == 0:
+                self.infer()
+                self.writer.add_scalar("Reward/avg", np.mean(rew_list), i)
+                self.writer.add_scalar("Reward/max", np.max(rew_list), i)
+                self.writer.add_scalar("Reward/min", np.min(rew_list), i)
+                self.writer.add_scalar("Steps/avg", np.mean(steps_list), i)
+                self.writer.add_scalar("Steps/max", np.max(steps_list), i)
+                self.writer.add_scalar("Steps/min", np.min(steps_list), i)
+                self.writer.add_scalar("Epsilon", self.epsilon, i)
 
-            if i % 1000 == 0 and i > 0:
-                printb(f"Avg Reward for {i}th iteration: {np.mean(rew_list):.2f}",
-                       f"Max Reward for {i}th iteration: {np.max(rew_list):.2f}",
-                       f"Min Reward for {i}th iteration: {np.min(rew_list):.2f}",
-                       f"Avg Loss for {i}th iteration: {np.mean(loss_list):.4f}",
-                       f"Max Loss for {i}th iteration: {np.max(loss_list):.4f}",
-                       f"Min Loss for {i}th iteration: {np.min(loss_list):.4f}",
-                       f"Avg Steps for {i}th iteration: {np.mean(steps_list):.2f}",
-                       f"Max Steps for {i}th iteration: {np.max(steps_list):.2f}",
-                       f"Min Steps for {i}th iteration: {np.min(steps_list):.2f}",
-                       f"Epsilon: {self.epsilon:.4f}")
                 rew_list.clear()
-                loss_list.clear()
                 steps_list.clear()
+        
         self.writer.close()
