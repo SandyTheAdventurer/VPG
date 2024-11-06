@@ -42,11 +42,11 @@ class VPG(Base):
             self.optimizer.zero_grad()
 
     def act(self, obs: torch.Tensor):
-        dist = self(obs.to(torch.float32))
+        dist = self(torch.tensor(obs, dtype=torch.float32))
         select = torch.distributions.Categorical(dist)
         action = select.sample()
         logit = select.log_prob(action)
-        return action, logit
+        return action.item(), logit
 
     def infer(self):
         obs, logit, reward = zip(*self.buffer)
@@ -70,7 +70,7 @@ class VPG(Base):
 
             while not terminated:
                 action, logit = self.act(obs)
-                obs, rew, terminated, truncated, _ = self.env.step(action.item())
+                obs, rew, terminated, truncated, _ = self.env.step(action)
                 obs = torch.tensor(obs, dtype=torch.float32, device='cuda')
                 total_reward += rew
                 self.buffer.append((obs, logit, rew))
